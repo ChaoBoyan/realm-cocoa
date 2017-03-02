@@ -33,12 +33,116 @@
 #import "RLMUtil.hpp"
 
 #import "object_store.hpp"
+#import "object_accessor.hpp"
 #import "results.hpp"
 #import "shared_realm.hpp"
 
 #import <objc/message.h>
 
 using namespace realm;
+
+namespace {
+struct Context {
+    RLMRealm *realm;
+    RLMClassInfo& info;
+    NSDictionary *defaultValues;
+
+    id defaultValue(NSString *key) {
+        if (!defaultValues) {
+            defaultValues = RLMDefaultValuesForObjectSchema(info.rlmObjectSchema);
+        }
+        return defaultValues[key];
+    }
+};
+}
+
+namespace realm {
+template<>
+class NativeAccessor<id, Context*> {
+public:
+    static id value_for_property(Context*, id dict, const std::string &prop_name,
+                                 size_t prop_index) {
+        if ([dict respondsToSelector:@selector(objectAtIndex:)])
+            return prop_index < [dict count] ? [dict objectAtIndex:prop_index] : nil;
+        if ([dict respondsToSelector:@selector(objectForKey:)]) {
+            return [dict objectForKey:@(prop_name.c_str())];
+        }
+        return [dict valueForKey:@(prop_name.c_str())];
+    }
+    
+    static bool dict_has_value_for_key(Context*, id dict, const std::string &prop_name) {
+        if ([dict respondsToSelector:@selector(objectForKey:)]) {
+            return [dict objectForKey:@(prop_name.c_str())];
+        }
+        return [dict valueForKey:@(prop_name.c_str())];
+    }
+
+    static id dict_value_for_key(Context*, id dict, const std::string &prop_name) {
+        return [dict valueForKey:@(prop_name.c_str())];
+    }
+
+    static size_t list_size(Context*, id v) { return [v count]; }
+    static id list_value_at_index(Context*, id v, size_t index) {
+        return [v objectAtIndex:index];
+    }
+
+    static bool has_default_value_for_property(Context* c, Realm*, ObjectSchema const&,
+                                               std::string const& prop)
+    {
+        return c->defaultValue(@(prop.c_str()));
+    }
+
+    static id default_value_for_property(Context* c, Realm*, ObjectSchema const&,
+                                         std::string const& prop)
+    {
+        return c->defaultValue(@(prop.c_str()));
+    }
+
+    static Timestamp to_timestamp(Context*, id v) { return RLMTimestampForNSDate(v); }
+    static bool to_bool(Context*, id v) { return [v boolValue]; }
+    static double to_double(Context*, id v) { return [v doubleValue]; }
+    static float to_float(Context*, id v) { return [v floatValue]; }
+    static long long to_long(Context*, id v) { return [v longLongValue]; }
+    static BinaryData to_binary(Context*, id v) { return RLMBinaryDataForNSData(v); }
+    static StringData to_string(Context*, id v) { return RLMStringDataWithNSString(v); }
+    static Mixed to_mixed(Context*, id) { throw std::logic_error("'Any' type is unsupported"); }
+
+    static id from_binary(Context*, BinaryData v) { return RLMBinaryDataToNSData(v); }
+    static id from_bool(Context*, bool v) { return @(v); }
+    static id from_double(Context*, double v) { return @(v); }
+    static id from_float(Context*, float v) { return @(v); }
+    static id from_long(Context*, long long v) { return @(v); }
+    static id from_string(Context*, StringData v) { return @(v.data()); }
+    static id from_timestamp(Context*, Timestamp v) { return RLMTimestampToNSDate(v); }
+    static id from_list(Context*, List v) {
+        // FIXME: this isn't possible; need parent RLMObject
+        return nil;
+    }
+    static id from_results(Context*, Results v) {
+        return nil;
+    }
+    static id from_object(Context*, Object v) {
+        return nil;
+    }
+
+    static bool is_null(Context*, id v) { return !v || v == NSNull.null; }
+    static id null_value(Context*) { return nil; }
+
+    static size_t to_existing_object_index(Context*, SharedRealm, id &) { return 0; }
+    static size_t to_object_index(Context* c, SharedRealm realm, id value, std::string const& object_type, bool update)
+    {
+        if (auto object = RLMDynamicCast<RLMObjectBase>(value)) {
+            if (object->_info && object->_realm->_realm == realm && object->_info->objectSchema->name == object_type) {
+                RLMVerifyAttached(object);
+                return object->_row.get_index();
+            }
+        }
+
+        Context subContext{c->realm, c->realm->_info[@(object_type.c_str())]};
+        return Object::create(&subContext, realm, *realm->schema().find(object_type), value, update).row().get_index();
+    }
+};
+}
 
 void RLMRealmCreateAccessors(RLMSchema *schema) {
     const size_t bufferSize = sizeof("RLM:Managed  ") // includes null terminator
@@ -352,88 +456,20 @@ void RLMAddObjectToRealm(__unsafe_unretained RLMObjectBase *const object,
     RLMInitializeSwiftAccessorGenerics(object);
 }
 
-RLMObjectBase *RLMCreateObjectInRealmWithValue(RLMRealm *realm, NSString *className, id value, bool createOrUpdate = false) {
+RLMObjectBase *RLMCreateObjectInRealmWithValue(RLMRealm *realm, NSString *className,
+                                               id value, bool createOrUpdate = false) {
     if (createOrUpdate && RLMIsObjectSubclass([value class])) {
         RLMObjectBase *obj = value;
-        if ([obj->_objectSchema.className isEqualToString:className] && obj->_realm == realm) {
+        if (obj->_realm == realm && [obj->_objectSchema.className isEqualToString:className]) {
             // This is a no-op if value is an RLMObject of the same type already backed by the target realm.
             return value;
         }
     }
 
-    // verify writable
-    RLMVerifyInWriteTransaction(realm);
-
-    // create the object
     auto& info = realm->_info[className];
+    Context c{realm, info};
     RLMObjectBase *object = RLMCreateManagedAccessor(info.rlmObjectSchema.accessorClass, realm, &info);
-
-    RLMCreationOptions creationOptions = createOrUpdate ? RLMCreationOptionsCreateOrUpdate : RLMCreationOptionsNone;
-
-    // create row, and populate
-    if (NSArray *array = RLMDynamicCast<NSArray>(value)) {
-        // get or create our accessor
-        bool foundExisting;
-        NSArray *props = info.rlmObjectSchema.properties;
-        auto primaryGetter = [=](__unsafe_unretained RLMProperty *const p) {
-            return array[[props indexOfObject:p]];
-        };
-        object->_row = (*info.table())[createOrGetRowForObject(info, primaryGetter, createOrUpdate, &foundExisting)];
-
-        // populate
-        for (NSUInteger i = 0; i < array.count; i++) {
-            RLMProperty *prop = props[i];
-
-            // skip primary key when updating since it doesn't change
-            if (prop.isPrimary)
-                continue;
-
-            id val = array[i];
-            validateValueForProperty(val, prop);
-            RLMDynamicSet(object, prop, RLMCoerceToNil(val), creationOptions);
-        }
-    }
-    else {
-        __block bool foundExisting = false;
-        __block NSDictionary *defaultValues = nil;
-        __block bool usedDefault = false;
-        auto getValue = ^(RLMProperty *prop) {
-            id propValue = RLMValidatedValueForProperty(value, prop.name, info.rlmObjectSchema.className);
-            usedDefault = !propValue && !foundExisting;
-            if (usedDefault) {
-                if (!defaultValues) {
-                    defaultValues = RLMDefaultValuesForObjectSchema(info.rlmObjectSchema);
-                }
-                propValue = defaultValues[prop.name];
-                if (!propValue && (prop.type == RLMPropertyTypeObject || prop.type == RLMPropertyTypeArray)) {
-                    propValue = NSNull.null;
-                }
-            }
-            return propValue;
-        };
-        // get or create our accessor
-        object->_row = (*info.table())[createOrGetRowForObject(info, getValue, createOrUpdate, &foundExisting)];
-
-        // populate
-        for (RLMProperty *prop in info.rlmObjectSchema.properties) {
-            // skip primary key when updating since it doesn't change
-            if (prop.isPrimary)
-                continue;
-
-            if (id propValue = getValue(prop)) {
-                validateValueForProperty(propValue, prop);
-                // add SetDefault to creationoptions
-                RLMCreationOptions propertyCreationOptions = creationOptions;
-                if (usedDefault) {
-                    propertyCreationOptions |= RLMCreationOptionsSetDefault;
-                }
-                RLMDynamicSet(object, prop, RLMCoerceToNil(propValue), propertyCreationOptions);
-            }
-            else if (!foundExisting && !prop.optional) {
-                @throw RLMException(@"Property '%@' of object of type '%@' cannot be nil.", prop.name, info.rlmObjectSchema.className);
-            }
-        }
-    }
+    object->_row = realm::Object::create<id, Context*>(&c, realm->_realm, *info.objectSchema, (id)value, createOrUpdate).row();
 
     RLMInitializeSwiftAccessorGenerics(object);
     return object;
